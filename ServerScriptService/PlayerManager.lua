@@ -27,14 +27,24 @@ local function LoadData(player) -- loads the players saved data from the data st
 	return success, result
 end
 
-local function SaveData(player, data) -- saves the players data to the data store
-	local success, result = pcall(function() -- use pcall so it doesnt break if the data store is down
-		PlayerData:SetAsync(player.UserId, data)
-	end)
-	if not success then
-		warn(result) -- warn if saving failed
+local function SaveData(player, data) -- saves the players data to the data store with retry logic
+	local maxRetries = 3
+	for attempt = 1, maxRetries do
+		local success, result = pcall(function() -- use pcall so it doesnt break if the data store is down
+			PlayerData:UpdateAsync(player.UserId, function(oldData)
+				return data -- UpdateAsync saves atomically, safer than SetAsync
+			end)
+		end)
+		if success then
+			return true
+		end
+		warn("Save attempt " .. attempt .. " failed for " .. player.Name .. ": " .. tostring(result))
+		if attempt < maxRetries then
+			task.wait(1) -- wait before retrying
+		end
 	end
-	return success
+	warn("All save attempts failed for " .. player.Name)
+	return false
 end
 
 
@@ -69,10 +79,19 @@ function PlayerManager.OnPlayerAdded(player) -- runs when a player joins the gam
 	end)
 	
 	local success, data = LoadData(player) -- try to load their saved data
-	sessionData[player.UserId] = success and data or { -- if loading failed give them default data
-		Money = 0,
-		UnlockIds = {} -- list of ids for things they have unlocked
-	}
+	if success and type(data) == "table" then
+		-- validate the loaded data has the expected fields, fill in any missing ones
+		sessionData[player.UserId] = {
+			Money = type(data.Money) == "number" and data.Money or 0,
+			UnlockIds = type(data.UnlockIds) == "table" and data.UnlockIds or {},
+		}
+	else
+		-- loading failed or data was nil/corrupted, give them default data
+		sessionData[player.UserId] = {
+			Money = 0,
+			UnlockIds = {} -- list of ids for things they have unlocked
+		}
+	end
 	
 	local leaderstats = LeaderboardSetup(PlayerManager.GetMoney(player)) -- create the leaderboard stats
 	leaderstats.Parent = player -- parent it to the player so it shows on the leaderboard
@@ -84,8 +103,8 @@ end
 function PlayerManager.OnCharacterAdded(player, character) -- runs when a players character spawns
 	local humanoid = character:FindFirstChild("Humanoid")
 	if humanoid then
-		humanoid.Died:Connect(function(character) -- when the player dies
-			wait(3) -- wait 3 seconds
+		humanoid.Died:Connect(function() -- when the player dies
+			task.wait(3) -- wait 3 seconds before respawning
 			player:LoadCharacter() -- respawn the player
 		end)
 	end
@@ -132,15 +151,14 @@ end
 
 function PlayerManager.OnPlayerRemoving(player) -- runs when a player leaves the game
 	SaveData(player, sessionData[player.UserId]) -- save their data before they go
+	sessionData[player.UserId] = nil -- clean up session data to prevent memory leak
 	playerRemoving:Fire(player) -- fire the event so other scripts know a player left
-	
 end
 
 
 function PlayerManager.OnClose() -- runs when the server is shutting down
-	
 	for _, player in ipairs(Players:GetPlayers()) do -- save every players data before the server closes
-		coroutine.wrap(PlayerManager.OnPlayerRemoving(player))() 
+		SaveData(player, sessionData[player.UserId]) -- save sequentially so all saves complete before shutdown
 	end
 end
 
